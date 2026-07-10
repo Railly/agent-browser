@@ -2434,9 +2434,13 @@ async fn try_auto_restore_state(state: &mut DaemonState) {
         if let Some(ref mgr) = state.browser {
             if let Ok(session_id) = mgr.active_session_id() {
                 match state::load_state(&mgr.client, session_id, &path).await {
-                    Ok(()) => {
+                    Ok(warnings) => {
                         state.restore_status = "loaded".to_string();
-                        state.restore_status_detail = None;
+                        state.restore_status_detail = if warnings.is_empty() {
+                            None
+                        } else {
+                            Some(warnings.join("; "))
+                        };
                         state.restore_loaded_path = Some(path.clone());
                         state.restore_load_failed = false;
                         state.restore_validation_pending = state.restore_check_url.is_some()
@@ -4576,9 +4580,13 @@ async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .and_then(|v| v.as_str())
         .ok_or("Missing 'path' parameter")?;
 
-    state::load_state(&mgr.client, &session_id, path).await?;
+    let warnings = state::load_state(&mgr.client, &session_id, path).await?;
     mark_explicit_storage_state_loaded(state, path);
-    Ok(json!({ "loaded": true, "path": path }))
+    let mut result = json!({ "loaded": true, "path": path });
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

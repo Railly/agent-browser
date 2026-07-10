@@ -460,7 +460,22 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Result<(), String> {
+/// How long each per-origin navigation during state load gets before the
+/// origin is skipped. Restoring storage requires navigating the tab to that
+/// origin, and an unreachable one (dead intranet host, stalled server) never
+/// answers `Page.navigate`, which used to abort the whole load at the 30s
+/// CDP timeout and wedge the daemon while the client retry loop re-queued
+/// the command (#1291).
+const STATE_LOAD_NAVIGATE_TIMEOUT_MS: u64 = 10_000;
+
+/// Returns the warnings for origins whose storage could not be restored.
+/// Unreachable origins are skipped instead of failing the whole load, so
+/// cookies and every reachable origin still apply.
+pub async fn load_state(
+    client: &CdpClient,
+    session_id: &str,
+    path: &str,
+) -> Result<Vec<String>, String> {
     let json_str = read_state_json(path)?;
 
     let state: StorageState =
@@ -476,6 +491,8 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
         cookies::set_cookies(client, session_id, cookie_values, None).await?;
     }
 
+    let mut warnings = Vec::new();
+
     // Load storage per origin
     for origin in &state.origins {
         if origin.local_storage.is_empty() && origin.session_storage.is_empty() {
@@ -484,13 +501,54 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
 
         // Navigate to origin to set storage
         let navigate_url = format!("{}/", origin.origin.trim_end_matches('/'));
-        client
-            .send_command(
-                "Page.navigate",
-                Some(json!({ "url": navigate_url })),
-                Some(session_id),
-            )
-            .await?;
+        let navigate = client.send_command(
+            "Page.navigate",
+            Some(json!({ "url": navigate_url })),
+            Some(session_id),
+        );
+        let nav_result = match tokio::time::timeout(
+            tokio::time::Duration::from_millis(STATE_LOAD_NAVIGATE_TIMEOUT_MS),
+            navigate,
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                warnings.push(format!(
+                    "storage for origin {} not restored: navigation failed: {}",
+                    origin.origin, e
+                ));
+                continue;
+            }
+            Err(_) => {
+                // Abandoning the navigation would leave the tab with a
+                // provisional load that wedges later renderer-bound
+                // commands; cancel it before moving on.
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from_millis(2_000),
+                    client.send_command_no_params("Page.stopLoading", Some(session_id)),
+                )
+                .await;
+                warnings.push(format!(
+                    "storage for origin {} not restored: origin did not respond within {}s",
+                    origin.origin,
+                    STATE_LOAD_NAVIGATE_TIMEOUT_MS / 1000
+                ));
+                continue;
+            }
+        };
+        // A failed navigation (DNS error, refused connection) still resolves
+        // with an errorText; storage set on the error page would silently
+        // land on the wrong origin.
+        if let Some(error_text) = nav_result.get("errorText").and_then(|v| v.as_str()) {
+            if !error_text.is_empty() {
+                warnings.push(format!(
+                    "storage for origin {} not restored: navigation failed: {}",
+                    origin.origin, error_text
+                ));
+                continue;
+            }
+        }
 
         // Brief wait for navigation
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -534,7 +592,7 @@ pub async fn load_state(client: &CdpClient, session_id: &str, path: &str) -> Res
         }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 fn is_state_file(path: &std::path::Path) -> bool {
@@ -1057,5 +1115,136 @@ mod tests {
         let result = dispatch_state_command(&cmd).unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Missing 'name' parameter");
+    }
+
+    // -----------------------------------------------------------------------
+    // load_state with unreachable origins (#1291)
+    // -----------------------------------------------------------------------
+
+    /// Mock CDP endpoint for load_state: answers everything except
+    /// `Page.navigate` to `http://dead.test/`, which gets NO response
+    /// (an unreachable origin never resolves the navigation), and answers
+    /// `http://error.test/` with an errorText (fast DNS-style failure).
+    /// Records every Runtime.evaluate expression it receives.
+    async fn start_mock_cdp_for_load_state(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+        let evaluated = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let evaluated_srv = evaluated.clone();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                let reply = match method {
+                    "Page.navigate" => {
+                        match cmd["params"]["url"].as_str().unwrap_or("") {
+                            // Unreachable origin: navigation never resolves.
+                            "http://dead.test/" => None,
+                            // Fast failure: resolves with an errorText.
+                            "http://error.test/" => Some(respond(
+                                json!({ "frameId": "F1", "errorText": "net::ERR_NAME_NOT_RESOLVED" }),
+                            )),
+                            _ => Some(respond(json!({ "frameId": "F1", "loaderId": "L1" }))),
+                        }
+                    }
+                    "Runtime.evaluate" => {
+                        let expr = cmd["params"]["expression"].as_str().unwrap_or("");
+                        evaluated_srv.lock().unwrap().push(expr.to_string());
+                        Some(respond(json!({ "result": { "type": "string", "value": "" } })))
+                    }
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        (url, evaluated)
+    }
+
+    /// Regression test for #1291: an unreachable origin in the state file
+    /// must not hang the load for the full CDP timeout (which wedged the
+    /// daemon while the client retry loop re-queued the command) nor abort
+    /// it; the origin is skipped with a warning and every other origin
+    /// still applies.
+    #[tokio::test]
+    async fn test_load_state_skips_unreachable_origin_with_warning() {
+        let (url, evaluated) = start_mock_cdp_for_load_state().await;
+        let client = crate::native::cdp::client::CdpClient::connect(&url)
+            .await
+            .expect("mock connect");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state-1291.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "cookies": [],
+                "origins": [
+                    { "origin": "http://dead.test", "localStorage": [{ "name": "kd", "value": "vd" }], "sessionStorage": [] },
+                    { "origin": "http://error.test", "localStorage": [{ "name": "ke", "value": "ve" }], "sessionStorage": [] },
+                    { "origin": "http://alive.test", "localStorage": [{ "name": "ka", "value": "va" }], "sessionStorage": [] },
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let warnings = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            load_state(&client, "S1", path.to_str().unwrap()),
+        )
+        .await
+        .expect("load_state must not hang on an unreachable origin")
+        .expect("load_state should skip unreachable origins instead of failing");
+
+        assert_eq!(warnings.len(), 2, "warnings: {:?}", warnings);
+        assert!(warnings[0].contains("dead.test"), "warnings: {:?}", warnings);
+        assert!(
+            warnings[1].contains("error.test") && warnings[1].contains("ERR_NAME_NOT_RESOLVED"),
+            "warnings: {:?}",
+            warnings
+        );
+
+        let exprs = evaluated.lock().unwrap().clone();
+        assert!(
+            exprs.iter().any(|e| e.contains("\"ka\"")),
+            "storage for the reachable origin must still apply: {:?}",
+            exprs
+        );
+        assert!(
+            !exprs.iter().any(|e| e.contains("\"kd\"") || e.contains("\"ke\"")),
+            "storage must not be set for skipped origins: {:?}",
+            exprs
+        );
     }
 }
