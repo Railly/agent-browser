@@ -6330,3 +6330,96 @@ async fn e2e_removeinitscript_roundtrip() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+// ---------------------------------------------------------------------------
+// Semantic locators inside a selected frame (#1460)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #1460: after `frame <selector>`, semantic locators
+/// (`find text`, `find role`, ...) must search the selected frame's document.
+/// They used to evaluate against the page session's main document, so the
+/// frame's content was invisible to them even though snapshot and click
+/// (frame-aware element path) saw it.
+#[tokio::test]
+#[ignore]
+async fn e2e_find_text_searches_selected_frame() {
+    let page = "data:text/html,<h1>outside</h1>\
+        <iframe id=\"f\" width=\"400\" height=\"200\" \
+        srcdoc=\"<button onclick=&quot;document.body.dataset.clicked='1'&quot;>Next Page</button>\">\
+        </iframe>";
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": page }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "frame", "selector": "#f" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The frame's text must be findable and clickable.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "getbytext", "text": "Next Page", "subaction": "click", "exact": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "5",
+            "action": "evaluate",
+            "script": "document.querySelector('#f').contentDocument.body.dataset.clicked || ''"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"], "1",
+        "the click must land on the button inside the frame"
+    );
+
+    // Main-frame text must NOT be visible from inside the frame.
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "getbytext", "text": "outside", "subaction": "click" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        resp["success"], false,
+        "main-frame text must not match while a frame is selected"
+    );
+
+    // Back on the main frame, the outer text is findable again.
+    let resp = execute_command(&json!({ "id": "7", "action": "mainframe" }), &mut state).await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "8", "action": "getbytext", "text": "outside", "subaction": "click" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}

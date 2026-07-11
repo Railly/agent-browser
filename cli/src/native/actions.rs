@@ -6878,9 +6878,98 @@ fn build_role_selector(role: &str, name: Option<&str>, exact: bool) -> String {
     }
 }
 
-async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+/// Run a locator query in the document selected with `frame`, falling back
+/// to the page's main document when no frame is selected. Semantic locators
+/// evaluate plain JS against `document`, which on the page session is always
+/// the MAIN frame's document — so with a frame selected they could never see
+/// the frame's content, while snapshot/click (which resolve through the
+/// frame-aware element path) could (#1460).
+/// - A cross-process iframe has a dedicated session whose main document IS
+///   the frame's document: evaluate there.
+/// - A same-process iframe has no session of its own: run the query against
+///   the frame owner's contentDocument, shadowing `document` in the
+///   callFunctionOn scope so the query string works unchanged.
+async fn evaluate_locator_query(state: &DaemonState, query: &str) -> Result<bool, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+
+    if let Some(ref frame_id) = state.active_frame_id {
+        if let Some(frame_session) = state.iframe_sessions.get(frame_id) {
+            let result: super::cdp::types::EvaluateResult = mgr
+                .client
+                .send_command_typed(
+                    "Runtime.evaluate",
+                    &super::cdp::types::EvaluateParams {
+                        expression: query.to_string(),
+                        return_by_value: Some(true),
+                        await_promise: Some(false),
+                    },
+                    Some(frame_session),
+                )
+                .await?;
+            return Ok(result
+                .result
+                .value
+                .as_ref()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
+        }
+
+        let owner =
+            super::element::frame_owner_object_id(&mgr.client, &session_id, frame_id).await?;
+        let function = format!(
+            "function() {{ const document = this.contentDocument; if (!document) return false; return ({query}); }}"
+        );
+        let result = mgr
+            .client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(json!({
+                    "objectId": owner,
+                    "functionDeclaration": function,
+                    "returnByValue": true,
+                })),
+                Some(&session_id),
+            )
+            .await?;
+        return Ok(result
+            .get("result")
+            .and_then(|r| r.get("value"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
+    }
+
+    let result: super::cdp::types::EvaluateResult = mgr
+        .client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &super::cdp::types::EvaluateParams {
+                expression: query.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(&session_id),
+        )
+        .await?;
+    Ok(result
+        .result
+        .value
+        .as_ref()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
+/// Remove the locator marker attribute from whichever document the locator
+/// query ran against.
+async fn cleanup_locator_marker(state: &DaemonState) {
+    let _ = evaluate_locator_query(
+        state,
+        "(() => { document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located'); return true; })()",
+    )
+    .await;
+}
+
+async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let role = cmd
         .get("role")
         .and_then(|v| v.as_str())
@@ -6920,26 +7009,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         name_match = name_match,
     );
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: js,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
-
-    if !result
-        .result
-        .value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    if !evaluate_locator_query(state, &js).await? {
         let desc = build_role_selector(role, name, exact);
         return Err(format!("No element found: {}", desc));
     }
@@ -6948,16 +7018,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     let result = execute_subaction(cmd, state, selector).await;
 
     // Clean up the marker attribute
-    if let Some(ref browser) = state.browser {
-        if browser.active_session_id().is_ok() {
-            let _ = browser
-                .evaluate(
-                    "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                    None,
-                )
-                .await;
-        }
-    }
+    cleanup_locator_marker(state).await;
 
     result
 }
@@ -6968,8 +7029,6 @@ async fn handle_semantic_locator(
     strategy: &str,
     param_name: &str,
 ) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let value = cmd
         .get(param_name)
         .and_then(|v| v.as_str())
@@ -7071,40 +7130,14 @@ async fn handle_semantic_locator(
         }
     };
 
-    let result: super::cdp::types::EvaluateResult = mgr
-        .client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &super::cdp::types::EvaluateParams {
-                expression: query,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&session_id),
-        )
-        .await?;
-
-    if !result
-        .result
-        .value
-        .as_ref()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
+    if !evaluate_locator_query(state, &query).await? {
         return Err(format!("No element found by {} '{}'", strategy, value));
     }
 
     let selector = "[data-agent-browser-located='true']";
     let action_result = execute_subaction(cmd, state, selector).await;
 
-    if let Some(ref browser) = state.browser {
-        let _ = browser
-            .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
-                None,
-            )
-            .await;
-    }
+    cleanup_locator_marker(state).await;
 
     action_result
 }
