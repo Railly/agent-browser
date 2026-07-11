@@ -6747,24 +6747,68 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             return Ok(json!({ "frame": label }));
         }
 
-        // CSS selector path
-        let js = format!(
-            r#"(() => {{
-                const el = document.querySelector({});
-                if (!el) return null;
-                if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {{
-                    return el.name || el.id || el.src || null;
-                }}
-                return null;
-            }})()"#,
-            serde_json::to_string(sel).unwrap_or_default()
-        );
-        let result = mgr.evaluate(&js, None).await?;
-        let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
-        if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
-            state.active_frame_id = Some(frame_id);
-            return Ok(json!({ "frame": frame_name }));
+        // CSS selector path: resolve the iframe element and ask DOM for its
+        // frame id directly, exactly like the ref path above. The previous
+        // approach matched `el.name || el.id || el.src` against the parent
+        // frame tree, which broke for out-of-process iframes (they are
+        // separate targets, absent from the parent's tree) and depended on
+        // Chrome mirroring the id into the frame name (#1445).
+        let doc = mgr
+            .client
+            .send_command(
+                "DOM.getDocument",
+                Some(json!({ "depth": 0 })),
+                Some(&session_id),
+            )
+            .await?;
+        let root_id = doc["root"]["nodeId"]
+            .as_i64()
+            .ok_or("Could not resolve the document root")?;
+        let found = mgr
+            .client
+            .send_command(
+                "DOM.querySelector",
+                Some(json!({ "nodeId": root_id, "selector": sel })),
+                Some(&session_id),
+            )
+            .await?;
+        let node_id = found["nodeId"].as_i64().unwrap_or(0);
+        if node_id == 0 {
+            return Err("Could not find frame for selector".to_string());
         }
+        let describe: Value = mgr
+            .client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({ "nodeId": node_id, "depth": 1 })),
+                Some(&session_id),
+            )
+            .await?;
+        let node_name = describe
+            .get("node")
+            .and_then(|n| n.get("nodeName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if node_name != "IFRAME" && node_name != "FRAME" {
+            return Err("Selector does not point to an iframe element".to_string());
+        }
+        let frame_id = describe
+            .get("node")
+            .and_then(|n| n.get("contentDocument"))
+            .and_then(|cd| cd.get("frameId"))
+            .and_then(|v| v.as_str())
+            // An out-of-process iframe has no inline contentDocument; its
+            // owner node carries the frameId directly.
+            .or_else(|| {
+                describe
+                    .get("node")
+                    .and_then(|n| n.get("frameId"))
+                    .and_then(|v| v.as_str())
+            })
+            .ok_or("Could not resolve frame ID for iframe element")?;
+
+        state.active_frame_id = Some(frame_id.to_string());
+        return Ok(json!({ "frame": sel }));
     }
 
     if let Some(frame_id) = find_frame(frame_tree, name, url) {

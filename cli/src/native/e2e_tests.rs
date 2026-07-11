@@ -6330,3 +6330,119 @@ async fn e2e_removeinitscript_roundtrip() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+// ---------------------------------------------------------------------------
+// Frame selection for out-of-process / dynamically injected iframes (#1445)
+// ---------------------------------------------------------------------------
+
+/// Serve a fixed HTML body on every request; returns the base URL.
+async fn start_fixed_html_server(
+    host_label: &str,
+    body: &'static str,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://{}:{}", host_label, port);
+
+    let handle = tokio::spawn(async move {
+        for _ in 0..50 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+/// Regression test for #1445: `frame <selector>` must work for iframes that
+/// are out-of-process or injected after page load. The old lookup matched
+/// `el.name || el.id || el.src` against the parent frame tree, which cannot
+/// contain out-of-process frames and relied on Chrome mirroring the id into
+/// the frame name; resolving the frameId via DOM.describeNode (like the ref
+/// path) covers every case.
+#[tokio::test]
+#[ignore]
+async fn e2e_frame_select_works_for_dynamic_cross_origin_iframe() {
+    // Different host labels put parent and child on different origins, so
+    // with site isolation the child gets its own process and is absent from
+    // the parent's frame tree.
+    let (parent_url, _h1) = start_fixed_html_server(
+        "127.0.0.1",
+        r#"<html><title>parent</title><body><h1>outside</h1><div id="slot"></div></body></html>"#,
+    )
+    .await;
+    let (child_url, _h2) = start_fixed_html_server(
+        "localhost",
+        r#"<html><title>child</title><body><p>cross origin child</p><button>Frame Button</button></body></html>"#,
+    )
+    .await;
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": parent_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Inject the cross-origin iframe after page load.
+    let inject = format!(
+        "const f = document.createElement('iframe'); f.src = '{}/'; f.id = 'dyn'; \
+         document.getElementById('slot').appendChild(f); 'injected'",
+        child_url
+    );
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "evaluate", "script": inject }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Give the OOPIF a moment to attach, then select it by CSS selector.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "frame", "selector": "#dyn" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The selection is real: snapshot now shows the frame's content.
+    let resp = execute_command(&json!({ "id": "5", "action": "snapshot" }), &mut state).await;
+    assert_success(&resp);
+    let snapshot = get_data(&resp)["snapshot"].as_str().unwrap_or_default();
+    assert!(
+        snapshot.contains("cross origin child"),
+        "snapshot must show the selected frame's content, got: {}",
+        snapshot
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
