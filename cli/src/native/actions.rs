@@ -330,6 +330,12 @@ pub struct DaemonState {
     pub stream_server: Option<Arc<StreamServer>>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
+    /// Storage state path already applied to the current browser. A launch
+    /// carrying the SAME path reuses the browser instead of forcing a clean
+    /// relaunch: the CLI sends an implicit launch on every invocation while
+    /// AGENT_BROWSER_STATE (or --state) is set, and unconditionally
+    /// relaunching reset the session to about:blank between commands (#1336).
+    loaded_storage_state: Option<String>,
     /// Browser engine name (e.g. "chrome", "lightpanda") for observability.
     pub engine: String,
     /// Default timeout for wait operations, from AGENT_BROWSER_DEFAULT_TIMEOUT env var.
@@ -407,6 +413,7 @@ impl DaemonState {
             stream_client: None,
             stream_server: None,
             launch_hash: None,
+            loaded_storage_state: None,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             // README documents 25s, intentionally below the CLI's 30s IPC
             // read timeout so the daemon reports a proper timeout error
@@ -1427,6 +1434,23 @@ fn validate_restore_config_from_command(cmd: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A launch carrying a storageState requires a clean local browser so the
+/// loaded state matches the file exactly — unless that same state file is
+/// already applied to the current browser. The CLI sends an implicit launch
+/// on every invocation while AGENT_BROWSER_STATE (or --state) is set, so an
+/// unconditional clean relaunch reset the session to about:blank between
+/// commands and made every navigation appear to vanish (#1336).
+fn storage_state_needs_clean_launch(
+    requested: Option<&str>,
+    loaded: Option<&str>,
+    is_external: bool,
+) -> bool {
+    match requested {
+        Some(req) if !is_external => loaded != Some(req),
+        _ => false,
+    }
+}
+
 fn command_changes_restore_key(cmd: &Value, state: &DaemonState) -> bool {
     cmd.get("restoreKey")
         .and_then(|v| v.as_str())
@@ -1480,6 +1504,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 
     close_active_provider_session(state).await;
     state.launch_hash = None;
+    state.loaded_storage_state = None;
     state.screencasting = false;
     state.reset_input_state();
     state.update_stream_client().await;
@@ -2661,6 +2686,7 @@ async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> R
         }
         if loaded {
             mark_explicit_storage_state_loaded(state, path);
+            state.loaded_storage_state = Some(path.clone());
         }
     }
 
@@ -2829,7 +2855,11 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             launch_connection_is_external(cdp_url, cdp_port, auto_connect, provider_name);
         let was_external = mgr.is_cdp_connection();
         let hash_changed = state.launch_hash != Some(new_hash);
-        let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
+        let storage_state_requires_clean_launch = storage_state_needs_clean_launch(
+            storage_state_owned.as_deref(),
+            state.loaded_storage_state.as_deref(),
+            is_external,
+        );
         is_external != was_external
             || hash_changed
             || storage_state_requires_clean_launch
@@ -2848,7 +2878,13 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             close_current_browser(state).await?;
         }
     } else {
-        load_storage_state(state, &storage_state_owned).await?;
+        // Skip the re-load when this exact state file is already applied:
+        // loading navigates the active tab through the state's origins, so
+        // re-applying it on every implicit launch would lose the page the
+        // same way the clean relaunch did (#1336).
+        if state.loaded_storage_state != storage_state_owned {
+            load_storage_state(state, &storage_state_owned).await?;
+        }
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();
@@ -4578,6 +4614,7 @@ async fn handle_state_load(cmd: &Value, state: &mut DaemonState) -> Result<Value
 
     state::load_state(&mgr.client, &session_id, path).await?;
     mark_explicit_storage_state_loaded(state, path);
+    state.loaded_storage_state = Some(path.to_string());
     Ok(json!({ "loaded": true, "path": path }))
 }
 
@@ -9778,6 +9815,35 @@ mod tests {
         assert!(state.restore_loaded_path.is_none());
         assert!(!state.restore_load_failed);
         assert_eq!(state.restore_save_status, "not_attempted");
+    }
+
+    /// #1336: a launch with the already-applied storageState must not force
+    /// a clean relaunch (the CLI sends one implicitly on every invocation
+    /// while AGENT_BROWSER_STATE / --state is set).
+    #[test]
+    fn test_storage_state_clean_launch_same_path_reuses() {
+        assert!(!storage_state_needs_clean_launch(
+            Some("/a.json"),
+            Some("/a.json"),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_storage_state_clean_launch_changed_or_unloaded_relaunches() {
+        assert!(storage_state_needs_clean_launch(
+            Some("/b.json"),
+            Some("/a.json"),
+            false
+        ));
+        assert!(storage_state_needs_clean_launch(Some("/a.json"), None, false));
+    }
+
+    #[test]
+    fn test_storage_state_clean_launch_external_or_absent_never_forces() {
+        assert!(!storage_state_needs_clean_launch(Some("/a.json"), None, true));
+        assert!(!storage_state_needs_clean_launch(None, Some("/a.json"), false));
+        assert!(!storage_state_needs_clean_launch(None, None, false));
     }
 
     #[test]

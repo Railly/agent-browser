@@ -5144,6 +5144,91 @@ async fn e2e_storage_state_launch_restarts_clean_browser() {
     let _ = std::fs::remove_file(&state_two);
 }
 
+/// Regression test for #1336: while AGENT_BROWSER_STATE (or --state) is set,
+/// the CLI sends an implicit launch carrying the same storageState on every
+/// invocation. Re-launching with the SAME state file must reuse the browser
+/// and keep the active page, instead of forcing a clean relaunch that reset
+/// the session to about:blank between commands.
+#[tokio::test]
+#[ignore]
+async fn e2e_storage_state_relaunch_same_file_keeps_page() {
+    let state_path = std::env::temp_dir()
+        .join(format!(
+            "agent-browser-e2e-storage-same-{}.json",
+            uuid::Uuid::new_v4()
+        ))
+        .to_string_lossy()
+        .to_string();
+
+    // Written directly (instead of create_storage_state_with_cookie) so the
+    // test needs no network at all: cookies apply via Network.setCookies and
+    // an empty origins list means state loading never navigates.
+    std::fs::write(
+        &state_path,
+        serde_json::to_string(&json!({
+            "cookies": [{
+                "name": "same_state_cookie",
+                "value": "kept",
+                "domain": ".example.com",
+                "path": "/",
+                "expires": 2000000000i64,
+                "httpOnly": false,
+                "secure": false,
+                "sameSite": "Lax"
+            }],
+            "origins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut state = DaemonState::new();
+
+    let launch = json!({
+        "id": "10",
+        "action": "launch",
+        "headless": true,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        "storageState": &state_path
+    });
+    let resp = execute_command(&launch, &mut state).await;
+    assert_success(&resp);
+
+    let page_url = "data:text/html,<title>kept-page</title><h1>kept</h1>";
+    let resp = execute_command(
+        &json!({ "id": "11", "action": "navigate", "url": page_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Same launch again — exactly what the CLI sends implicitly on the next
+    // invocation while the state flag/env var is still set.
+    let mut relaunch = launch.clone();
+    relaunch["id"] = json!("12");
+    let resp = execute_command(&relaunch, &mut state).await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp).get("reused"),
+        Some(&json!(true)),
+        "a launch with the already-applied storageState must reuse the browser"
+    );
+
+    let resp = execute_command(&json!({ "id": "13", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    let url = get_data(&resp)["url"].as_str().unwrap_or_default();
+    assert!(
+        url.starts_with("data:text/html"),
+        "the active page must survive an implicit relaunch with the same storageState, got: {}",
+        url
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+
+    let _ = std::fs::remove_file(&state_path);
+}
+
 /// Verify that AGENT_BROWSER_STATE env var restores cookies at auto-launch
 /// time (when the browser is lazily launched by a command like `navigate`
 /// rather than an explicit `launch` command).
