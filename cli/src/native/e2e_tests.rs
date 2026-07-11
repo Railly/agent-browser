@@ -2848,6 +2848,62 @@ async fn e2e_click_reports_covering_overlay() {
 // Profile cookie persistence across restarts
 // ---------------------------------------------------------------------------
 
+/// Regression test for #1378: launching a second browser on a profile that
+/// a running Chrome already holds must fail fast with an error naming the
+/// lock collision, instead of the generic "Chrome exited early" plus a
+/// misleading --no-sandbox hint. Once the first browser closes, the same
+/// profile must launch normally again (stale locks are ignored).
+#[tokio::test]
+#[ignore]
+async fn e2e_second_session_same_profile_reports_lock_collision() {
+    let profile_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-profile-lock-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let launch = json!({
+        "id": "1",
+        "action": "launch",
+        "headless": true,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        "profile": profile_dir.to_str().unwrap()
+    });
+
+    let mut first = DaemonState::new();
+    let resp = execute_command(&launch, &mut first).await;
+    assert_success(&resp);
+
+    let mut second = DaemonState::new();
+    let resp = execute_command(&launch, &mut second).await;
+    assert_eq!(
+        resp["success"], false,
+        "second launch on a locked profile must fail, got: {}",
+        resp
+    );
+    let error = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("already in use by a running Chrome"),
+        "error must name the profile lock collision, got: {}",
+        error
+    );
+    assert!(
+        !error.contains("--no-sandbox"),
+        "the sandbox hint is the wrong diagnostic for a lock collision: {}",
+        error
+    );
+
+    let resp = execute_command(&json!({ "id": "9", "action": "close" }), &mut first).await;
+    assert_success(&resp);
+
+    // The profile is free again: a fresh launch must succeed.
+    let resp = execute_command(&launch, &mut second).await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "10", "action": "close" }), &mut second).await;
+    assert_success(&resp);
+
+    let _ = std::fs::remove_dir_all(&profile_dir);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_profile_cookie_persistence() {

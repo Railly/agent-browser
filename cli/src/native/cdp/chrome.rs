@@ -258,6 +258,35 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     })
 }
 
+/// Chrome enforces one running instance per user-data-dir via a
+/// `SingletonLock` symlink whose target is `<hostname>-<pid>`. A second
+/// Chrome on the same profile either aborts (headless) or silently hands
+/// off to the running instance and exits 0 (headed), so it never writes
+/// DevToolsActivePort and the generic launch error blames the sandbox
+/// instead of the real collision (#1378). Returns the pid holding a live
+/// lock; a stale lock from a crashed Chrome is ignored (Chrome takes those
+/// over on launch).
+#[cfg(unix)]
+fn live_profile_lock_pid(user_data_dir: &Path) -> Option<i32> {
+    let target = std::fs::read_link(user_data_dir.join("SingletonLock")).ok()?;
+    let target = target.to_string_lossy().into_owned();
+    let pid: i32 = target.rsplit('-').next()?.parse().ok()?;
+    // kill(pid, 0) probes process existence without sending a signal.
+    (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+}
+
+#[cfg(unix)]
+fn profile_lock_collision_error(user_data_dir: &Path, pid: i32) -> String {
+    format!(
+        "Chrome profile {} is already in use by a running Chrome (pid {}).\n\
+         Chrome allows a single running instance per profile (--user-data-dir), so this launch cannot proceed.\n\
+         Hint: give each concurrent session its own profile — pass a different --profile for this session, \
+         or remove the shared `profile` from ~/.agent-browser/config.json so named sessions stay isolated.",
+        user_data_dir.display(),
+        pid
+    )
+}
+
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
@@ -301,6 +330,17 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     }
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
+
+    // Fail fast on a profile already locked by a running Chrome: retrying
+    // cannot help, and the misleading generic error cost users real
+    // debugging time (#1378).
+    #[cfg(unix)]
+    if let Some(ref profile) = effective_options.profile {
+        let dir = PathBuf::from(expand_tilde(profile));
+        if let Some(pid) = live_profile_lock_pid(&dir) {
+            return Err(profile_lock_collision_error(&dir, pid));
+        }
+    }
 
     let max_attempts = 3;
     let mut last_err = String::new();
@@ -411,6 +451,15 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
                 Err(fallback_err) => {
                     let _ = child.kill();
                     cleanup_temp_dir(&temp_user_data_dir);
+                    // A launch that raced another Chrome onto the same
+                    // profile dies without DevToolsActivePort; surface the
+                    // lock collision instead of the generic error (#1378).
+                    #[cfg(unix)]
+                    if temp_user_data_dir.is_none() {
+                        if let Some(pid) = live_profile_lock_pid(&user_data_dir) {
+                            return Err(profile_lock_collision_error(&user_data_dir, pid));
+                        }
+                    }
                     return Err(format!(
                         "{}\n(also tried parsing stderr) {}",
                         primary_err, fallback_err
@@ -1990,5 +2039,46 @@ mod tests {
 
         let result = resolve_cdp_from_active_port(port, "/devtools/browser/dead").await;
         assert!(result.is_err(), "should fail when nothing is listening");
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile SingletonLock collision detection (#1378)
+    // -----------------------------------------------------------------------
+
+    /// The lock target is `<hostname>-<pid>`, and hostnames can themselves
+    /// contain dashes (e.g. `MacBook-Pro-de-X.local-62321`).
+    #[cfg(unix)]
+    #[test]
+    fn test_live_profile_lock_pid_detects_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_pid = std::process::id();
+        std::os::unix::fs::symlink(
+            format!("Some-Host-name.local-{}", own_pid),
+            dir.path().join("SingletonLock"),
+        )
+        .unwrap();
+
+        assert_eq!(live_profile_lock_pid(dir.path()), Some(own_pid as i32));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_profile_lock_pid_ignores_stale_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pid that cannot be running (beyond typical pid_max).
+        std::os::unix::fs::symlink("host.local-99999999", dir.path().join("SingletonLock"))
+            .unwrap();
+
+        assert_eq!(live_profile_lock_pid(dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_live_profile_lock_pid_no_lock_or_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(live_profile_lock_pid(dir.path()), None);
+
+        std::os::unix::fs::symlink("not-a-pid-target-", dir.path().join("SingletonLock")).unwrap();
+        assert_eq!(live_profile_lock_pid(dir.path()), None);
     }
 }
