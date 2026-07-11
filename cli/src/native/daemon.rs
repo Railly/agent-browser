@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,6 +198,12 @@ async fn run_socket_server(
     // after a "close" command, instead of calling process::exit() which skips
     // destructors and can leave Chrome processes orphaned (issue #1113).
     let close_notify = Arc::new(Notify::new());
+    // Set as soon as a close response is written, before the grace sleep
+    // that lets the client read it. Commands that race into that window
+    // used to be served normally: they reported success, could even launch
+    // a fresh browser, and the daemon then exited anyway, deleting session
+    // files and orphaning that browser (#1367).
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
     drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -209,12 +216,17 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        if shutting_down.load(Ordering::SeqCst) {
+                            drop(stream);
+                            continue;
+                        }
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let sd = shutting_down.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, reset_tx, sf, cn, sd).await;
                         });
                     }
                     Err(e) => {
@@ -313,6 +325,7 @@ async fn run_socket_server(
     let reset_tx = idle_timeout_ms.map(|_| Arc::new(reset_tx));
 
     let close_notify = Arc::new(Notify::new());
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
@@ -328,12 +341,17 @@ async fn run_socket_server(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
+                        if shutting_down.load(Ordering::SeqCst) {
+                            drop(stream);
+                            continue;
+                        }
                         let state = state.clone();
                         let reset_tx = reset_tx.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let sd = shutting_down.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, reset_tx, sf, cn).await;
+                            handle_connection(stream, state, reset_tx, sf, cn, sd).await;
                         });
                     }
                     Err(e) => {
@@ -395,6 +413,7 @@ async fn handle_connection<S>(
     idle_reset_tx: Option<Arc<mpsc::Sender<()>>>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
+    shutting_down: Arc<AtomicBool>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -440,6 +459,21 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
+                // A command that lands after a close response was written
+                // must not be served: the daemon is about to exit, so any
+                // state this command builds is destroyed immediately after
+                // it reports success (#1367).
+                if shutting_down.load(Ordering::SeqCst) {
+                    let err = serde_json::json!({
+                        "success": false,
+                        "error": "Daemon is shutting down after close; retry the command",
+                    });
+                    let mut resp = serde_json::to_string(&err).unwrap_or_default();
+                    resp.push('\n');
+                    let _ = writer.write_all(resp.as_bytes()).await;
+                    continue;
+                }
+
                 let response = {
                     let mut s = state.lock().await;
                     execute_command(&cmd, &mut s).await
@@ -452,6 +486,11 @@ async fn handle_connection<S>(
                 }
 
                 if close_completed_response(&action, &response) {
+                    // Stop serving new work immediately: the grace sleep
+                    // below only exists so the client can read the close
+                    // response, and commands racing into it used to build
+                    // state that the imminent exit destroyed (#1367).
+                    shutting_down.store(true, Ordering::SeqCst);
                     if let Some(ref path) = stream_file_cleanup {
                         let _ = fs::remove_file(path);
                     }
@@ -562,6 +601,75 @@ fn get_port_for_session(session: &str) -> u16 {
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    /// Regression tests for #1367: commands racing into the post-close
+    /// shutdown window must not be served.
+    async fn drive_connection(
+        shutting_down: Arc<AtomicBool>,
+        input: &str,
+    ) -> (String, Arc<AtomicBool>) {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let close_notify = Arc::new(Notify::new());
+        let sd = shutting_down.clone();
+        let handle = tokio::spawn(async move {
+            handle_connection(server, state, None, None, close_notify, sd).await;
+        });
+
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        write_half
+            .write_all(input.as_bytes())
+            .await
+            .expect("write command");
+        let mut reader = BufReader::new(&mut read_half);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read response");
+        // Dropping a split half does not close the duplex stream; an explicit
+        // shutdown delivers EOF so the handler's read loop exits.
+        let _ = write_half.shutdown().await;
+        let _ = handle.await;
+        (line, shutting_down)
+    }
+
+    #[tokio::test]
+    async fn test_close_sets_shutting_down_before_returning_response() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (line, flag) = drive_connection(
+            flag,
+            "{\"id\":\"1\",\"action\":\"close\"}\n",
+        )
+        .await;
+        let resp: Value = serde_json::from_str(&line).expect("json response");
+        assert_eq!(resp["success"], true, "close should succeed: {}", line);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "a completed close must mark the daemon as shutting down"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commands_after_close_are_rejected() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (line, _) = drive_connection(
+            flag,
+            "{\"id\":\"2\",\"action\":\"state_list\"}\n",
+        )
+        .await;
+        let resp: Value = serde_json::from_str(&line).expect("json response");
+        assert_eq!(
+            resp["success"], false,
+            "a command during shutdown must not be served: {}",
+            line
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shutting down"),
+            "error must explain the shutdown: {}",
+            line
+        );
+    }
 
     #[test]
     fn test_daemon_socket_dir_matches_client_namespace() {
