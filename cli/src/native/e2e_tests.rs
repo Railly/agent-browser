@@ -6330,3 +6330,84 @@ async fn e2e_removeinitscript_roundtrip() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+// ---------------------------------------------------------------------------
+// select on non-<select> elements (#1105)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #1105: `select` on an ARIA combobox (Radix, Headless
+/// UI style) is not a native <select>. It used to report success while doing
+/// nothing (the TypeError from `this.options` was swallowed); it must fail
+/// with an error that names the widget kind and the interaction that works.
+#[tokio::test]
+#[ignore]
+async fn e2e_select_on_aria_combobox_fails_with_guidance() {
+    let page = "data:text/html,\
+        <button id=\"combo\" role=\"combobox\" aria-expanded=\"false\">Select Position</button>\
+        <div id=\"plain\">not a select</div>\
+        <select id=\"native\"><option>A</option><option>B</option></select>";
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": page }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // ARIA combobox: must fail and point at the working interaction.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "select", "selector": "#combo", "value": "Product Manager" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        resp["success"], false,
+        "select on an ARIA combobox must not report success: {}",
+        resp
+    );
+    let error = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("ARIA combobox"),
+        "error must name the widget kind and guidance, got: {}",
+        error
+    );
+
+    // Any other non-<select>: clear error naming the tag.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "select", "selector": "#plain", "value": "x" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(resp["success"], false);
+    let error = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("native <select>"),
+        "error must explain select only works on <select>, got: {}",
+        error
+    );
+
+    // Native <select> still works.
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "select", "selector": "#native", "value": "B" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}

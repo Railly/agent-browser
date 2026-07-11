@@ -441,7 +441,18 @@ pub async fn select_option(
     // Matching nothing must be an error, not a silent success: an agent that
     // selects a misspelled option otherwise sees "Done", and only discovers
     // the page state is wrong after more commands. List what was available.
+    // The same goes for non-<select> elements: `this.options` is undefined
+    // there, and the resulting TypeError used to be swallowed as a silent
+    // success. ARIA combobox widgets (Radix, Headless UI) are the common
+    // case, so point the agent at the interaction that does work (#1105).
     let js = r#"function(vals) {
+            if (this.tagName !== 'SELECT') {
+                const role = this.getAttribute('role') || '';
+                if (role === 'combobox' || this.getAttribute('aria-haspopup') === 'listbox') {
+                    return { error: 'Element is an ARIA combobox, not a native <select>. Interact with it instead: click the combobox to open it, then click the option (e.g. `find text "<option>" click`).' };
+                }
+                return { error: 'select only works on native <select> elements; this is <' + this.tagName.toLowerCase() + '>' + (role ? ' with role="' + role + '"' : '') + '.' };
+            }
             const options = Array.from(this.options);
             let matched = 0;
             for (const opt of options) {
@@ -473,6 +484,19 @@ pub async fn select_option(
             Some(&effective_session_id),
         )
         .await?;
+
+    // A thrown exception inside the function produces exceptionDetails and
+    // no return value; treating that as success hid every failure mode of
+    // this call behind a green checkmark.
+    if let Some(exception) = result.get("exceptionDetails") {
+        let text = exception
+            .get("exception")
+            .and_then(|e| e.get("description"))
+            .and_then(|d| d.as_str())
+            .or_else(|| exception.get("text").and_then(|t| t.as_str()))
+            .unwrap_or("select failed with a script exception");
+        return Err(format!("select failed: {}", text));
+    }
 
     if let Some(error) = result
         .get("result")
