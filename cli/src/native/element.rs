@@ -692,6 +692,12 @@ fn build_find_element_js(selector: &str) -> String {
 
 /// Same as build_find_element_js but rooted at an arbitrary Document
 /// expression (e.g. an iframe's contentDocument).
+///
+/// CSS selectors fall back to walking open shadow roots when the light DOM
+/// has no match: web-component UIs (and the internal locator marker, which a
+/// semantic locator can set on a shadowed element) are otherwise unreachable
+/// by selector (#1266). XPath stays light-DOM-only, as the DOM standard
+/// offers no shadow-piercing XPath evaluation.
 fn build_find_element_js_in(root: &str, selector: &str) -> String {
     if let Some(xpath) = selector.strip_prefix("xpath=") {
         format!(
@@ -700,7 +706,23 @@ fn build_find_element_js_in(root: &str, selector: &str) -> String {
         )
     } else {
         format!(
-            "{root}.querySelector({selector})",
+            "(() => {{
+                const sel = {selector};
+                const direct = {root}.querySelector(sel);
+                if (direct) return direct;
+                const stack = [{root}];
+                while (stack.length) {{
+                    const scope = stack.pop();
+                    for (const el of scope.querySelectorAll('*')) {{
+                        if (el.shadowRoot) {{
+                            const hit = el.shadowRoot.querySelector(sel);
+                            if (hit) return hit;
+                            stack.push(el.shadowRoot);
+                        }}
+                    }}
+                }}
+                return null;
+            }})()",
             selector = serde_json::to_string(selector).unwrap_or_default(),
         )
     }
@@ -1379,7 +1401,10 @@ mod tests {
     #[test]
     fn test_build_selector_js_css() {
         let js = build_selector_js("#submit-btn");
-        assert!(js.contains("document.querySelector(\"#submit-btn\")"));
+        assert!(js.contains("document.querySelector(sel)"));
+        assert!(js.contains("\"#submit-btn\""));
+        // The shadow-root fallback must be present for CSS selectors (#1266).
+        assert!(js.contains("shadowRoot"));
         assert!(!js.contains("document.evaluate"));
     }
 

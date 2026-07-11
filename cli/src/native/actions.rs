@@ -6785,6 +6785,24 @@ async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
 // Semantic locator handlers
 // ---------------------------------------------------------------------------
 
+/// JS prelude injected into locator queries so they see into open shadow
+/// roots: `abRoots()` lists the document plus every open shadow root, and
+/// `abQueryAll(sel)` runs querySelectorAll across all of them (#1266).
+const LOCATOR_SHADOW_PRELUDE_JS: &str = r#"
+                const abRoots = () => {
+                    const roots = [document];
+                    const stack = [document];
+                    while (stack.length) {
+                        const scope = stack.pop();
+                        for (const el of scope.querySelectorAll('*')) {
+                            if (el.shadowRoot) { roots.push(el.shadowRoot); stack.push(el.shadowRoot); }
+                        }
+                    }
+                    return roots;
+                };
+                const abQueryAll = (sel) => abRoots().flatMap((r) => Array.from(r.querySelectorAll(sel)));
+"#;
+
 async fn execute_subaction(
     cmd: &Value,
     state: &mut DaemonState,
@@ -6907,7 +6925,8 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
     let js = format!(
         r#"(() => {{
-            const els = document.querySelectorAll('[role="{role}"], {role}');
+            {prelude}
+            const els = abQueryAll('[role="{role}"], {role}');
             for (const el of els) {{
                 if ({name_match}) {{
                     el.setAttribute('data-agent-browser-located', 'true');
@@ -6916,6 +6935,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             }}
             return false;
         }})()"#,
+        prelude = LOCATOR_SHADOW_PRELUDE_JS,
         role = role,
         name_match = name_match,
     );
@@ -6952,7 +6972,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         if browser.active_session_id().is_ok() {
             let _ = browser
                 .evaluate(
-                    "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                    "(() => { const stack = [document]; while (stack.length) { const scope = stack.pop(); const hit = scope.querySelector('[data-agent-browser-located]'); if (hit) { hit.removeAttribute('data-agent-browser-located'); return; } for (const el of scope.querySelectorAll('*')) { if (el.shadowRoot) stack.push(el.shadowRoot); } } })()",
                     None,
                 )
                 .await;
@@ -7001,64 +7021,81 @@ async fn handle_semantic_locator(
             };
             format!(
                 r#"(() => {{
+                {prelude}
+                const byId = (el, id) => {{
+                    const root = el.getRootNode();
+                    return (root.getElementById ? root : document).getElementById(id);
+                }};
                 const matches = {matches_fn};
-                const label = Array.from(document.querySelectorAll('label')).find(el => matches(el.textContent));
+                const label = abQueryAll('label').find(el => matches(el.textContent));
                 if (label) {{
                     const forId = label.getAttribute('for');
-                    const target = forId ? document.getElementById(forId) : label.querySelector('input,select,textarea');
+                    const target = forId ? byId(label, forId) : label.querySelector('input,select,textarea');
                     if (target) {{ target.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 }}
-                const aria = Array.from(document.querySelectorAll('[aria-label]')).find(el => matches(el.getAttribute('aria-label')));
+                const aria = abQueryAll('[aria-label]').find(el => matches(el.getAttribute('aria-label')));
                 if (aria) {{ aria.setAttribute('data-agent-browser-located', 'true'); return true; }}
-                const referenced = Array.from(document.querySelectorAll('[aria-labelledby]')).find(el => {{
+                const referenced = abQueryAll('[aria-labelledby]').find(el => {{
                     const text = el.getAttribute('aria-labelledby').split(/\s+/)
-                        .map(id => {{ const r = document.getElementById(id); return r ? r.textContent : ''; }})
+                        .map(id => {{ const r = byId(el, id); return r ? r.textContent : ''; }})
                         .join(' ');
                     return matches(text);
                 }});
                 if (referenced) {{ referenced.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 return false;
             }})()"#,
+                prelude = LOCATOR_SHADOW_PRELUDE_JS,
             )
         }
         "placeholder" => format!(
             r#"(() => {{
-                const el = document.querySelector('input[placeholder={val}], textarea[placeholder={val}]');
+                {prelude}
+                const el = abQueryAll('input[placeholder={val}], textarea[placeholder={val}]')[0];
                 if (el) {{ el.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 return false;
             }})()"#,
+            prelude = LOCATOR_SHADOW_PRELUDE_JS,
             val = serde_json::to_string(value).unwrap_or_default(),
         ),
         "alttext" => format!(
             r#"(() => {{
-                const el = document.querySelector('img[alt={val}], [alt={val}]');
+                {prelude}
+                const el = abQueryAll('img[alt={val}], [alt={val}]')[0];
                 if (el) {{ el.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 return false;
             }})()"#,
+            prelude = LOCATOR_SHADOW_PRELUDE_JS,
             val = serde_json::to_string(value).unwrap_or_default(),
         ),
         "title" => format!(
             r#"(() => {{
-                const el = document.querySelector('[title={val}]');
+                {prelude}
+                const el = abQueryAll('[title={val}]')[0];
                 if (el) {{ el.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 return false;
             }})()"#,
+            prelude = LOCATOR_SHADOW_PRELUDE_JS,
             val = serde_json::to_string(value).unwrap_or_default(),
         ),
         "testid" => format!(
             r#"(() => {{
-                const el = document.querySelector('[data-testid={val}]');
+                {prelude}
+                const el = abQueryAll('[data-testid={val}]')[0];
                 if (el) {{ el.setAttribute('data-agent-browser-located', 'true'); return true; }}
                 return false;
             }})()"#,
+            prelude = LOCATOR_SHADOW_PRELUDE_JS,
             val = serde_json::to_string(value).unwrap_or_default(),
         ),
         _ => {
             // "text" strategy
             format!(
                 r#"(() => {{
-                    const all = document.querySelectorAll('*');
+                    {prelude}
+                    const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
+                    const all = abQueryAll('*');
                     for (const el of all) {{
+                        if (SKIP.has(el.tagName)) continue;
                         if (el.children.length === 0 && {match_fn}) {{
                             el.setAttribute('data-agent-browser-located', 'true');
                             return true;
@@ -7066,6 +7103,7 @@ async fn handle_semantic_locator(
                     }}
                     return false;
                 }})()"#,
+                prelude = LOCATOR_SHADOW_PRELUDE_JS,
                 match_fn = match_fn,
             )
         }
@@ -7100,7 +7138,7 @@ async fn handle_semantic_locator(
     if let Some(ref browser) = state.browser {
         let _ = browser
             .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                "(() => { const stack = [document]; while (stack.length) { const scope = stack.pop(); const hit = scope.querySelector('[data-agent-browser-located]'); if (hit) { hit.removeAttribute('data-agent-browser-located'); return; } for (const el of scope.querySelectorAll('*')) { if (el.shadowRoot) stack.push(el.shadowRoot); } } })()",
                 None,
             )
             .await;
@@ -7189,7 +7227,7 @@ async fn handle_nth(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     if let Some(ref browser) = state.browser {
         let _ = browser
             .evaluate(
-                "document.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located')",
+                "(() => { const stack = [document]; while (stack.length) { const scope = stack.pop(); const hit = scope.querySelector('[data-agent-browser-located]'); if (hit) { hit.removeAttribute('data-agent-browser-located'); return; } for (const el of scope.querySelectorAll('*')) { if (el.shadowRoot) stack.push(el.shadowRoot); } } })()",
                 None,
             )
             .await;

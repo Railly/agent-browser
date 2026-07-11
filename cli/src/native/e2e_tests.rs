@@ -6330,3 +6330,87 @@ async fn e2e_removeinitscript_roundtrip() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+// ---------------------------------------------------------------------------
+// Semantic locators through open shadow DOM (#1266)
+// ---------------------------------------------------------------------------
+
+/// Regression test for #1266: semantic locators only queried the light DOM,
+/// so elements inside open shadow roots (web-component UIs) were invisible
+/// to `find placeholder/label/text/...` even though snapshot saw them. The
+/// locator queries, the marker resolution, and the marker cleanup must all
+/// pierce open shadow roots.
+#[tokio::test]
+#[ignore]
+async fn e2e_semantic_locators_pierce_open_shadow_dom() {
+    let page = "data:text/html,<div id=\"host\"></div>\
+        <script>const r=document.getElementById('host').attachShadow({mode:'open'});\
+        r.innerHTML=`<input type=\"password\" placeholder=\"Password\">\
+        <span onclick=\"document.title='span-clicked'\">only in shadow</span>`;</script>";
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": page }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // Placeholder locator + fill must reach into the shadow root.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "getbyplaceholder", "placeholder": "Password", "subaction": "fill", "value": "hunter2" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({
+            "id": "4",
+            "action": "evaluate",
+            "script": "document.getElementById('host').shadowRoot.querySelector('input').value"
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["result"], "hunter2",
+        "fill must land on the shadowed input"
+    );
+
+    // Text locator + click: the text exists in the page source only inside
+    // the shadow root (and inside the <script> tag, which must be skipped).
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "getbytext", "text": "only in shadow", "subaction": "click" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "6", "action": "evaluate", "script": "document.title" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        get_data(&resp)["result"], "span-clicked",
+        "the click must land on the real shadowed span, not the script tag"
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
