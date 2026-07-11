@@ -7703,7 +7703,16 @@ async fn handle_har_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     state.har_recording = false;
 
-    let entries: Vec<Value> = state.har_entries.drain(..).map(har_entry_to_json).collect();
+    // Fetch response bodies best-effort: Chrome only retains them while the
+    // page that made the request is still alive, so a body that is already
+    // evicted just leaves `content.text` absent instead of failing the
+    // export (#1204).
+    let collected: Vec<HarEntry> = state.har_entries.drain(..).collect();
+    let mut entries: Vec<Value> = Vec::with_capacity(collected.len());
+    for e in collected {
+        let body = har_fetch_response_body(state, &e.request_id).await;
+        entries.push(har_entry_to_json(e, body));
+    }
     let request_count = entries.len();
     let browser = har_browser_metadata(state).await;
 
@@ -7731,8 +7740,42 @@ async fn handle_har_stop(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 // HAR serialization helpers
 // ---------------------------------------------------------------------------
 
+/// Ask Chrome for the response body of a captured request. Bodies belong to
+/// the session that issued the request, so try the active page first and
+/// fall back to iframe sessions. `None` means Chrome no longer has it.
+async fn har_fetch_response_body(
+    state: &DaemonState,
+    request_id: &str,
+) -> Option<(String, bool)> {
+    let mgr = state.browser.as_ref()?;
+    let mut sessions: Vec<String> = Vec::new();
+    if let Ok(sid) = mgr.active_session_id() {
+        sessions.push(sid.to_string());
+    }
+    sessions.extend(state.iframe_sessions.values().cloned());
+    for sid in sessions {
+        if let Ok(v) = mgr
+            .client
+            .send_command(
+                "Network.getResponseBody",
+                Some(json!({ "requestId": request_id })),
+                Some(&sid),
+            )
+            .await
+        {
+            let text = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
+            let base64 = v
+                .get("base64Encoded")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            return Some((text.to_string(), base64));
+        }
+    }
+    None
+}
+
 /// Convert a `HarEntry` (collected from CDP events) into a HAR 1.2 entry object.
-fn har_entry_to_json(e: HarEntry) -> Value {
+fn har_entry_to_json(e: HarEntry, body: Option<(String, bool)>) -> Value {
     let started_date_time = har_wall_time_to_rfc3339(e.wall_time);
 
     let request_cookies = e
@@ -7786,6 +7829,17 @@ fn har_entry_to_json(e: HarEntry) -> Value {
         .unwrap_or("text/plain")
         .to_string();
 
+    let mut content = json!({
+        "size": e.response_body_size,
+        "mimeType": mime_type,
+    });
+    if let Some((text, base64)) = body {
+        content["text"] = json!(text);
+        if base64 {
+            content["encoding"] = json!("base64");
+        }
+    }
+
     let mut request = json!({
         "method": e.method,
         "url": e.url,
@@ -7810,10 +7864,7 @@ fn har_entry_to_json(e: HarEntry) -> Value {
             "httpVersion": e.http_version,
             "cookies": resp_cookies,
             "headers": resp_headers,
-            "content": {
-                "size": e.response_body_size,
-                "mimeType": mime_type,
-            },
+            "content": content,
             "redirectURL": e.redirect_url,
             "headersSize": -1,
             "bodySize": e.response_body_size,
@@ -10802,8 +10853,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             loading_finished_timestamp: None,
         };
 
-        let har = har_entry_to_json(entry);
+        let har = har_entry_to_json(entry, Some(("{\"ok\":true}".to_string(), false)));
         assert_eq!(har["startedDateTime"], "2026-03-15T12:00:00Z");
+        assert_eq!(har["response"]["content"]["text"], "{\"ok\":true}");
+        assert!(har["response"]["content"].get("encoding").is_none());
         assert_eq!(har["request"]["method"], "POST");
         assert_eq!(har["request"]["httpVersion"], "HTTP/2.0");
         assert_eq!(har["request"]["queryString"][0]["name"], "foo");
@@ -10883,7 +10936,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             cdp_timing: None,
             loading_finished_timestamp: None,
         };
-        let har = har_entry_to_json(entry);
+        let har = har_entry_to_json(entry, None);
+        assert!(
+            har["response"]["content"].get("text").is_none(),
+            "an evicted body must leave content.text absent"
+        );
         assert_eq!(har["response"]["cookies"][0]["name"], "token");
         assert_eq!(har["response"]["cookies"][0]["value"], "abc");
     }

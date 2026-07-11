@@ -6330,3 +6330,130 @@ async fn e2e_removeinitscript_roundtrip() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+// ---------------------------------------------------------------------------
+// HAR response bodies (#1204)
+// ---------------------------------------------------------------------------
+
+/// Tiny HTTP server for the HAR test: an HTML page that fetches a JSON
+/// endpoint, so the capture includes two content types.
+async fn start_har_fixture_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{}", port);
+
+    let handle = tokio::spawn(async move {
+        for _ in 0..30 {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let (content_type, body) = if path.starts_with("/data.json") {
+                    ("application/json", r#"{"hello":"har-world","n":42}"#.to_string())
+                } else {
+                    (
+                        "text/html",
+                        r#"<html><title>har</title><body>page<script>fetch('/data.json')</script></body></html>"#.to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type,
+                    body.len(),
+                    body,
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (base_url, handle)
+}
+
+/// Regression test for #1204: HAR exports carried mimeType and size but no
+/// `response.content.text`, making them useless for replay tooling. Bodies
+/// must be captured for both document and XHR/fetch responses.
+#[tokio::test]
+#[ignore]
+async fn e2e_har_includes_response_bodies() {
+    let (base_url, _h) = start_har_fixture_server().await;
+    let har_path = std::env::temp_dir()
+        .join(format!("agent-browser-e2e-har-{}.har", uuid::Uuid::new_v4()))
+        .to_string_lossy()
+        .to_string();
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"]
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "2", "action": "har_start" }), &mut state).await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "navigate", "url": base_url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "har_stop", "path": &har_path }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let har: Value =
+        serde_json::from_str(&std::fs::read_to_string(&har_path).unwrap()).unwrap();
+    let entries = har["log"]["entries"].as_array().unwrap();
+
+    let json_entry = entries
+        .iter()
+        .find(|e| e["request"]["url"].as_str().unwrap_or("").contains("/data.json"))
+        .expect("the fetch request must be captured");
+    let text = json_entry["response"]["content"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("har-world"),
+        "the JSON response body must be in content.text, got: {:?}",
+        json_entry["response"]["content"]
+    );
+
+    let doc_entry = entries
+        .iter()
+        .find(|e| e["response"]["content"]["mimeType"] == "text/html")
+        .expect("the document request must be captured");
+    let text = doc_entry["response"]["content"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("<html>"),
+        "the document body must be in content.text, got: {:?}",
+        doc_entry["response"]["content"]
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+    let _ = std::fs::remove_file(&har_path);
+}
