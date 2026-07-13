@@ -88,13 +88,17 @@ fn validate_lightpanda_options(options: &LaunchOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// How long a live renderer gets to answer the liveness probe before the
-/// tab is treated as discarded/crashed (#1528). Healthy renderers answer in
-/// milliseconds even under load; discarded ones never answer.
-const RENDERER_PROBE_TIMEOUT_MS: u64 = 3_000;
+/// How long the liveness probe waits before treating a tab as discarded (#1528).
+/// A healthy renderer answers fast, so this only delays reviving dead tabs; too
+/// short and a live-but-busy tab gets reloaded and loses its state. Bias generous.
+const RENDERER_PROBE_TIMEOUT_MS: u64 = 6_000;
 
 /// How long a revived renderer gets to start answering after Page.reload.
 const REVIVED_RENDERER_TIMEOUT_MS: u64 = 10_000;
+
+/// Upper bound on the Page.reload revival call so a slow browser can't make it
+/// ride send_command's 30s ceiling while the daemon holds its state lock (#1528).
+const REVIVE_RELOAD_TIMEOUT_MS: u64 = 8_000;
 
 /// Returns true for Chrome internal targets that should not be selected
 /// during auto-connect (e.g. chrome://, chrome-extension://, devtools://).
@@ -669,15 +673,28 @@ impl BrowserManager {
         {
             return Ok(false);
         }
-        self.client
-            .send_command_no_params("Page.reload", Some(session_id))
-            .await
-            .map_err(|e| {
-                format!(
+        match tokio::time::timeout(
+            Duration::from_millis(REVIVE_RELOAD_TIMEOUT_MS),
+            self.client
+                .send_command_no_params("Page.reload", Some(session_id)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                return Err(format!(
                     "tab is not responding (discarded or crashed) and Page.reload failed: {}",
                     e
-                )
-            })?;
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "tab is not responding (discarded or crashed) and Page.reload did not \
+                     respond within {}ms",
+                    REVIVE_RELOAD_TIMEOUT_MS
+                ))
+            }
+        }
         if self
             .renderer_responds(session_id, REVIVED_RENDERER_TIMEOUT_MS)
             .await
@@ -2421,6 +2438,234 @@ mod tests {
         assert_eq!(
             mgr.active_page_index, 0,
             "a failed switch must not leave the active tab pointing at a dead renderer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for #1528: tab-switch failure modes beyond the original
+    // discarded-tab symptom.
+    // -----------------------------------------------------------------------
+
+    /// Mock where the second tab's renderer is ALIVE but slow: it answers
+    /// renderer-bound commands, just after `eval_delay_ms`. A genuinely
+    /// discarded tab never answers at all; this one does. Page.reload is
+    /// answered normally.
+    async fn start_mock_cdp_browser_with_slow_alive_tab(eval_delay_ms: u64) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let session = cmd["sessionId"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                // Renderer-bound probe on the slow tab: answer, but late.
+                if session == "S-T-SLOW" && method == "Runtime.evaluate" {
+                    tokio::time::sleep(Duration::from_millis(eval_delay_ms)).await;
+                    let r = respond(
+                        json!({ "result": { "type": "string", "value": "https://slow.test/" } }),
+                    );
+                    let _ = tx.send(Message::Text(r)).await;
+                    continue;
+                }
+
+                let reply = match method {
+                    "Target.setDiscoverTargets" | "Target.setAutoAttach" => {
+                        Some(respond(json!({})))
+                    }
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ALIVE", "type": "page", "title": "alive",
+                              "url": "https://alive.test/", "attached": false },
+                            { "targetId": "T-SLOW", "type": "page", "title": "slow",
+                              "url": "https://slow.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{}", target) })))
+                    }
+                    "Runtime.evaluate" => Some(respond(
+                        json!({ "result": { "type": "string", "value": "https://alive.test/" } }),
+                    )),
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        url
+    }
+
+    /// A live-but-slow renderer (answers after the probe window) must not be
+    /// misclassified as discarded and reloaded, which would destroy its page
+    /// state (#1528).
+    #[tokio::test]
+    async fn test_tab_switch_does_not_reload_live_but_slow_tab() {
+        let url = start_mock_cdp_browser_with_slow_alive_tab(4_000).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        assert_eq!(mgr.pages.len(), 2);
+
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching to a live tab should succeed");
+
+        assert_ne!(
+            result.get("revived"),
+            Some(&json!(true)),
+            "a LIVE but slow renderer (answers at 4s) was silently reloaded by the 3s probe, \
+             destroying page state (note #1)"
+        );
+    }
+
+    /// Mock where the second tab is genuinely discarded (renderer-bound
+    /// commands never answered) and Page.reload is answered only after
+    /// `reload_delay_ms`, modeling a browser process slow to reload.
+    async fn start_mock_cdp_browser_with_slow_reload(reload_delay_ms: u64) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/mock",
+            listener.local_addr().unwrap().port()
+        );
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let method = cmd["method"].as_str().unwrap_or("");
+                let session = cmd["sessionId"].as_str().unwrap_or("");
+                let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
+
+                // The discarded tab's slow Page.reload: the browser process
+                // eventually answers, but only after a long delay. The client
+                // has no outer timeout on this call (unlike the probes), so it
+                // rides send_command's 30s ceiling, blocking the daemon.
+                if session == "S-T-DISCARDED" && method == "Page.reload" {
+                    tokio::time::sleep(Duration::from_millis(reload_delay_ms)).await;
+                    let _ = tx.send(Message::Text(respond(json!({})))).await;
+                    continue;
+                }
+
+                let reply = match method {
+                    "Target.setDiscoverTargets" | "Target.setAutoAttach" => {
+                        Some(respond(json!({})))
+                    }
+                    "Target.getTargets" => Some(respond(json!({
+                        "targetInfos": [
+                            { "targetId": "T-ALIVE", "type": "page", "title": "alive",
+                              "url": "https://alive.test/", "attached": false },
+                            { "targetId": "T-DISCARDED", "type": "page", "title": "discarded",
+                              "url": "https://discarded.test/", "attached": false },
+                        ]
+                    }))),
+                    "Target.attachToTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("");
+                        Some(respond(json!({ "sessionId": format!("S-{}", target) })))
+                    }
+                    // Discarded renderer never answers renderer-bound commands.
+                    _ if session == "S-T-DISCARDED" => None,
+                    "Runtime.evaluate" => Some(respond(
+                        json!({ "result": { "type": "string", "value": "https://alive.test/" } }),
+                    )),
+                    _ => Some(respond(json!({}))),
+                };
+                if let Some(r) = reply {
+                    let _ = tx.send(Message::Text(r)).await;
+                }
+            }
+        });
+
+        url
+    }
+
+    /// A bounded Page.reload makes a slow reload fail fast instead of riding
+    /// send_command's 30s ceiling and wedging the daemon (#1528).
+    #[tokio::test]
+    async fn test_tab_switch_bounds_slow_reload() {
+        // Reload answered only after 35s (past send_command's 30s ceiling):
+        // pre-fix the switch rides ~33s, post-fix it fails fast under the bound.
+        let url = start_mock_cdp_browser_with_slow_reload(35_000).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1)).await;
+
+        assert!(
+            outcome.is_ok(),
+            "tab_switch stayed blocked past 20s on a slow Page.reload; the reload wait is \
+             unbounded (rides the 30s send_command ceiling) and wedges the daemon (note #2)"
+        );
+    }
+
+    /// A liveness probe that times out (discarded tab never answers) must not
+    /// leave its CDP request behind in the pending map after the switch (#1528).
+    #[tokio::test]
+    async fn test_tab_switch_cancelled_probe_leaves_no_pending_request() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+
+        // The switch probes the discarded tab, times out, and revives it; the
+        // timed-out probe's request must be cleaned up, not orphaned.
+        let _ = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("switching to a discarded tab should revive it");
+
+        // Cleanup runs on the guard's drop via a spawned task; let it settle.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            mgr.client.pending_len().await,
+            0,
+            "a cancelled probe left an orphaned CDP request in the pending map"
         );
     }
 }

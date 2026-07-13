@@ -341,6 +341,8 @@ agent-browser click @e3              # click uses docs's refs
 agent-browser tab close docs         # close by label
 ```
 
+A tab discarded by Chrome's Memory Saver is automatically reloaded when you switch to, connect to, or close onto it; the reload discards unsaved page state, and switch results include `"revived": true` when it happened.
+
 ### Frames
 
 ```bash
