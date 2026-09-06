@@ -1,6 +1,6 @@
 # Obscura
 
-[Obscura](https://github.com/h4ckf0r0day/obscura) is a headless browser engine written in Rust. It runs real JavaScript through V8, speaks the Chrome DevTools Protocol, and is built as a drop-in replacement for headless Chrome for web scraping and AI agent automation.
+[Obscura](https://github.com/h4ckf0r0day/obscura) is a headless browser engine written in Rust. It runs real JavaScript through V8, speaks the Chrome DevTools Protocol, and targets web scraping and AI agent automation.
 
 agent-browser manages Obscura the same way it manages Chrome. It spawns the `obscura serve` process, connects over CDP, and shuts it down when done. All downstream commands (snapshot, click, fill, screenshot, and so on) run through the same CDP path.
 
@@ -92,7 +92,7 @@ agent-browser returns a clear error if you combine `--engine obscura` with unsup
 
 ## When to Use Obscura
 
-Obscura is a good fit for:
+Potential uses to evaluate include:
 
 - Web scraping and data extraction with real JavaScript execution
 - AI agent workflows that want a lightweight CDP target
@@ -100,3 +100,11 @@ Obscura is a good fit for:
 - Setups that want a privacy-first, consistent browser fingerprint (Obscura ships an optional stealth mode)
 
 Use Chrome when you need full browser fidelity, extensions, or persistent profiles.
+
+## Experimental Obscura provider
+
+Select `--engine obscura --executable-path /path/to/obscura` to launch a local Obscura binary. This provider is experimental. Obscura v0.2.2 has known accessibility naming, hidden-element, iframe and screenshot fidelity gaps; successful CDP connection does not establish Chrome parity. Use Chrome for workflows that depend on these features until validated against your target pages.
+
+Local development pages require `OBSCURA_ALLOW_PRIVATE_NETWORK=1` in the environment before the session starts. Close and relaunch the named session when changing engine launch settings. Stealth support depends on how the Obscura binary was built. Chrome-only options including `--webgpu` and `--ca-cert` are rejected.
+
+MCP tools use the same provider through `extraArgs`: `["--engine", "obscura", "--executable-path", "/path/to/obscura"]`. A separate engine-specific MCP tool is unnecessary because tools delegate to the canonical CLI parser.

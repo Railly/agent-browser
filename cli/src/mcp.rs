@@ -2009,7 +2009,7 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         json!({
             "type": "array",
             "items": { "type": "string" },
-            "description": "Advanced: extra CLI arguments for this command, preserving full CLI parity."
+            "description": "Advanced: extra CLI arguments, including --engine chrome|lightpanda|obscura and --executable-path, preserving full CLI parity."
         }),
     );
     props.insert(
@@ -4409,6 +4409,21 @@ mod tests {
         let payload: Value = serde_json::from_str(&args[5]).unwrap();
         assert_eq!(payload["siteKey"], "abc");
         assert_eq!(payload["url"], "https://example.com");
+    }
+
+    #[test]
+    fn obscura_extra_args_use_the_canonical_cli_parser() {
+        let arguments =
+            json!({"extraArgs": ["--engine", "obscura", "--executable-path", "/tmp/obscura"]});
+        let mut args = vec!["open".to_string(), "https://example.com".to_string()];
+        args.extend(
+            optional_string_array(&arguments, "extraArgs")
+                .unwrap()
+                .unwrap(),
+        );
+        let flags = crate::flags::parse_flags(&args);
+        assert_eq!(flags.engine.as_deref(), Some("obscura"));
+        assert_eq!(flags.executable_path.as_deref(), Some("/tmp/obscura"));
     }
 
     #[test]

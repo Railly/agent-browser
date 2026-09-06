@@ -3996,6 +3996,7 @@ Environment:
   AGENT_BROWSER_NO_AUTO_DIALOG   Disable automatic dismissal of alert/beforeunload dialogs
   AGENT_BROWSER_PLUGINS          JSON plugin registry override
   AGENT_BROWSER_ENGINE           Browser engine: chrome (default), lightpanda, obscura
+  OBSCURA_ALLOW_PRIVATE_NETWORK Allow Obscura to access local/private pages (set before launch)
   AGENT_BROWSER_OBSCURA_STEALTH  Run the Obscura engine in stealth mode (consistent fingerprint, tracker blocking)
   HTTP_PROXY / HTTPS_PROXY       Standard proxy env vars (fallback if AGENT_BROWSER_PROXY not set)
   ALL_PROXY                      SOCKS proxy (fallback for proxy)

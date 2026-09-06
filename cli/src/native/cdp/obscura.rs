@@ -20,6 +20,10 @@ pub struct ObscuraProcess {
 }
 
 impl ObscuraProcess {
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_some()
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -444,6 +448,19 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_obscura_process_reports_exit() {
+        let child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut process = ObscuraProcess {
+            child,
+            ws_url: String::new(),
+            _log_drainers: Vec::new(),
+        };
+        process.child.wait().unwrap();
+        assert!(process.has_exited());
     }
 
     #[test]

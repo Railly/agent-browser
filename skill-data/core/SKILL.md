@@ -532,3 +532,11 @@ That pulls in:
 - `references/proxy-support.md`: proxy configuration and CA certificates for HTTPS interception proxies
 - `references/webgpu.md` — screenshots/video of WebGPU pages (three.js, Babylon.js), Linux/CI setup
 - `templates/*` — starter shell scripts for auth, capture, form automation
+
+## Experimental Obscura provider
+
+Select `--engine obscura --executable-path /path/to/obscura` to launch a local Obscura binary. This provider is experimental. Obscura v0.2.2 has known accessibility naming, hidden-element, iframe and screenshot fidelity gaps; successful CDP connection does not establish Chrome parity. Use Chrome for workflows that depend on these features until validated against your target pages.
+
+Local development pages require `OBSCURA_ALLOW_PRIVATE_NETWORK=1` in the environment before the session starts. Close and relaunch the named session when changing engine launch settings. Stealth support depends on how the Obscura binary was built. Chrome-only options including `--webgpu` and `--ca-cert` are rejected.
+
+MCP tools use the same provider through `extraArgs`: `["--engine", "obscura", "--executable-path", "/path/to/obscura"]`. A separate engine-specific MCP tool is unnecessary because tools delegate to the canonical CLI parser.

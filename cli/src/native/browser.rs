@@ -155,6 +155,12 @@ fn validate_obscura_options(options: &LaunchOptions) -> Result<(), String> {
     if !options.headless {
         return Err("Headed mode is not supported with Obscura (headless only)".to_string());
     }
+    if options.webgpu {
+        return Err("WebGPU (--webgpu) is not supported with Obscura".to_string());
+    }
+    if options.ca_cert.is_some() {
+        return Err("--ca-cert is not supported with Obscura (Chromium only)".to_string());
+    }
     if !options.args.is_empty() {
         return Err("Custom Chrome arguments (--args) are not supported with Obscura".to_string());
     }
@@ -422,7 +428,7 @@ impl BrowserProcess {
         match self {
             BrowserProcess::Chrome(p) => p.has_exited(),
             BrowserProcess::Lightpanda(_) => false,
-            BrowserProcess::Obscura(_) => false,
+            BrowserProcess::Obscura(p) => p.has_exited(),
         }
     }
 }
@@ -2479,6 +2485,11 @@ async fn initialize_obscura_manager(
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
             next_tab_id: 1,
+            direct_page: false,
+            pin_tab: false,
+            bound_target_id: None,
+            bound_target_gone: None,
+            headless: true,
         };
 
         let remaining = match remaining_until(deadline) {
@@ -2564,6 +2575,21 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    #[test]
+    fn test_obscura_rejects_chrome_only_options() {
+        assert!(validate_obscura_options(&LaunchOptions::default()).is_ok());
+        let mut options = LaunchOptions::default();
+        options.webgpu = true;
+        assert!(validate_obscura_options(&options)
+            .unwrap_err()
+            .contains("WebGPU"));
+        options.webgpu = false;
+        options.ca_cert = Some("root.pem".into());
+        assert!(validate_obscura_options(&options)
+            .unwrap_err()
+            .contains("--ca-cert"));
+    }
 
     #[test]
     fn test_format_tab_id() {
